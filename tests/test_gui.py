@@ -150,6 +150,49 @@ class GuiTests(unittest.TestCase):
         self.assertLessEqual(entry_bottom, self.root.winfo_rooty() + self.root.winfo_height())
         self.assertGreater(terminal.output.winfo_height(), 35)
 
+    def test_add_system_lets_user_choose_run_py_without_app_py(self):
+        folder = Path(self.tmp.name) / "Run Only Project"
+        folder.mkdir()
+        script = folder / "run.py"
+        script.write_text('print("RUN PY SELECTED", flush=True)\n', encoding="utf-8")
+        with patch("launcher.filedialog.askdirectory", return_value=str(folder)), \
+                patch("launcher.filedialog.askopenfilename", return_value=str(script)):
+            self.ui.add_system()
+        item = create_system(folder, "run.py")
+        self.assertIn(item.id, self.ui.services)
+        runtime = self.ui.services[item.id]
+        self.assertEqual(runtime.config.entry_file, "run.py")
+        self.assertTrue(self.pump_until(lambda: "RUN PY SELECTED" in runtime.text.get("1.0", "end")))
+
+    def test_settings_save_entry_file_and_launch_it(self):
+        script = self.appfolder / "run.py"
+        script.write_text('print("NEW ENTRY", flush=True)\n', encoding="utf-8")
+        self.ui.edit_system(self.item.id)
+        self.root.update()
+        dialog = next(w for w in self.root.winfo_children() if isinstance(w, tk.Toplevel))
+        def descendants(widget):
+            for child in widget.winfo_children():
+                yield child
+                yield from descendants(child)
+        widgets = list(descendants(dialog))
+        entry = next(w for w in widgets if isinstance(w, tk.Entry) and w.get() == "app.py")
+        entry.delete(0, "end")
+        entry.insert(0, "run.py")
+        save_button = next(w for w in widgets if isinstance(w, tk.Button) and w["text"] == "Save Changes")
+        self.assertTrue(save_button.winfo_viewable())
+        save_button.invoke()
+        rt = self.ui.services[self.item.id]
+        self.assertEqual(rt.config.entry_file, "run.py")
+        self.ui.start(self.item.id)
+        self.assertTrue(self.pump_until(lambda: "NEW ENTRY" in rt.text.get("1.0", "end")))
+
+    def test_cancel_entry_selection_does_not_register_or_start_system(self):
+        with patch("launcher.filedialog.askdirectory", return_value=str(self.appfolder)), \
+                patch("launcher.filedialog.askopenfilename", return_value=""):
+            self.ui.add_system()
+        self.assertEqual(len(self.ui.services), 1)
+        self.assertIsNone(self.ui.services[self.item.id].process)
+
 
 if __name__ == "__main__":
     unittest.main()

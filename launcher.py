@@ -1,7 +1,7 @@
-"""Datatelcom System Manager — Windows desktop process supervisor.
+"""PythonRunManager — Windows desktop process supervisor.
 
 Tkinter/ttk only; designed to be packaged with PyInstaller --onefile --windowed.
-Every system is explicitly registered via a folder containing root-level app.py.
+Every system is explicitly registered with a folder and chosen Python entry file.
 Each registered system gets application logs and an independent command terminal.
 """
 from __future__ import annotations
@@ -24,11 +24,11 @@ from tkinter import filedialog, messagebox, ttk
 from launcher_core import (
     APP_NAME, MAX_SYSTEMS, LauncherConfig, SystemConfig, command_for,
     config_path, create_system, load_config, normalized_folder,
-    save_config, update_system,
+    save_config, update_system, valid_folder,
 )
 from terminal_ui import CommandTerminal
 
-VERSION = "3.1"
+VERSION = "1.0.0"
 POLL_MS = 100
 MAX_OUTPUT_EVENTS = 2500
 MAX_VISIBLE_LINES = 1800
@@ -188,7 +188,7 @@ class LauncherUI:
         top.pack(fill="x")
         head = tk.Frame(top, bg=BG)
         head.pack(side="left", fill="x", expand=True)
-        self._label(head, "DATATELCOM  /  SYSTEM MANAGER", bg=BG,
+        self._label(head, "PYTHON RUN MANAGER", bg=BG,
                     size=18, bold=True).pack(anchor="w")
         self._label(head, "A single workspace for your Python systems and their live terminals",
                     bg=BG, color=MUTED, size=10).pack(anchor="w", pady=(4, 0))
@@ -271,7 +271,7 @@ class LauncherUI:
         self._label(page, "Select a system from the left to open its dedicated live terminal.",
                     color=MUTED, size=11).pack(anchor="w", pady=(7, 24))
         steps = (
-            ("01", "Add a Python system", "Browse to a folder that contains app.py directly inside it."),
+            ("01", "Add a Python system", "Choose a project folder and its entry file: app.py, run.py or another Python script."),
             ("02", "Manage it independently", "Start, stop and restart without affecting other systems."),
             ("03", "Use its terminal", "Run Python, pip and Git in each system's folder; view application logs alongside."),
             ("04", "Set launch behavior", "Rename systems, select Python and configure auto-start / crash recovery."),
@@ -382,7 +382,7 @@ class LauncherUI:
         details.pack(fill="x")
         rt.tab_info = self._label(details, "PID —   •   Uptime —", color=MUTED, size=9)
         rt.tab_info.pack(side="right")
-        rt.tab_path = self._label(details, rt.config.folder, color=MUTED, size=9)
+        rt.tab_path = self._label(details, f"{rt.config.folder}  /  {rt.config.entry_file}", color=MUTED, size=9)
         rt.tab_path.pack(side="left", fill="x", expand=True)
 
         controls = tk.Frame(panel, bg=PANEL, padx=22, pady=8)
@@ -476,11 +476,18 @@ class LauncherUI:
     def add_system(self) -> None:
         if self.closing:
             return
-        folder_name = filedialog.askdirectory(parent=self.root, title="Choose a folder with app.py at its root", mustexist=True)
+        folder_name = filedialog.askdirectory(parent=self.root, title="Choose the system's project folder", mustexist=True)
         if not folder_name:
             return
         try:
-            cfg = create_system(Path(folder_name))
+            folder = valid_folder(folder_name)
+            selected_file = filedialog.askopenfilename(
+                parent=self.root, title="Choose entry file (app.py, run.py, or another .py file)",
+                initialdir=str(folder), filetypes=[("Python scripts", "*.py")])
+            if not selected_file:
+                return
+            entry_file = Path(selected_file).resolve(strict=True).relative_to(folder).as_posix()
+            cfg = create_system(folder, entry_file)
         except (OSError, ValueError) as exc:
             messagebox.showerror("Cannot add system", str(exc), parent=self.root)
             return
@@ -508,8 +515,8 @@ class LauncherUI:
         cfg = rt.config
         dialog = tk.Toplevel(self.root, bg=PANEL)
         dialog.title("System Settings — " + cfg.name)
-        dialog.geometry("560x510")
-        dialog.minsize(480, 480)
+        dialog.geometry("600x640")
+        dialog.minsize(560, 620)
         dialog.transient(self.root)
         dialog.grab_set()
         dialog.columnconfigure(0, weight=1)
@@ -519,12 +526,32 @@ class LauncherUI:
         self._label(form, cfg.folder, color=MUTED, size=9, wraplength=500).pack(anchor="w", pady=(3, 22))
         name_var = tk.StringVar(value=cfg.name)
         python_var = tk.StringVar(value=cfg.python_path or "")
+        entry_var = tk.StringVar(value=cfg.entry_file)
         autostart_var = tk.BooleanVar(value=cfg.auto_start)
         recovery_var = tk.BooleanVar(value=cfg.restart_on_crash)
         self._label(form, "Display name", color=MUTED, size=10, bold=True).pack(anchor="w")
         name_field = tk.Entry(form, textvariable=name_var, bg=SURFACE, fg=TEXT,
                               insertbackground=TEXT, borderwidth=0, font=("Segoe UI", 11))
         name_field.pack(fill="x", pady=(6, 17), ipady=9)
+        self._label(form, "Python entry file (relative to the project folder)", color=MUTED, size=10, bold=True).pack(anchor="w")
+        entry_row = tk.Frame(form, bg=PANEL)
+        entry_row.pack(fill="x", pady=(6, 5))
+        entry_field = tk.Entry(entry_row, textvariable=entry_var, bg=SURFACE, fg=TEXT,
+                               insertbackground=TEXT, borderwidth=0, font=("Segoe UI", 10))
+        entry_field.pack(side="left", fill="x", expand=True, ipady=9)
+
+        def browse_entry() -> None:
+            selected = filedialog.askopenfilename(
+                parent=dialog, title="Choose Python entry file", initialdir=cfg.folder,
+                filetypes=[("Python scripts", "*.py")])
+            if selected:
+                try:
+                    entry_var.set(Path(selected).resolve(strict=True).relative_to(Path(cfg.folder)).as_posix())
+                except (OSError, ValueError):
+                    messagebox.showerror("Invalid entry file", "Choose a .py file inside this system's project folder.", parent=dialog)
+        ui_button(entry_row, "Browse", browse_entry, small=True).pack(side="left", padx=(6, 0))
+        self._label(form, "Examples: app.py, run.py, src/main.py. Changes apply on the next Start or Restart.",
+                    color=MUTED, size=9, wraplength=500).pack(anchor="w", pady=(0, 12))
         tk.Checkbutton(form, text="Auto-start this system when launcher opens", variable=autostart_var,
                        bg=PANEL, fg=TEXT, activebackground=PANEL, activeforeground=TEXT,
                        selectcolor=SURFACE, font=("Segoe UI", 10)).pack(anchor="w", pady=(0, 10))
@@ -552,7 +579,8 @@ class LauncherUI:
         def save() -> None:
             try:
                 changed = update_system(cfg, name=name_var.get(), auto_start=autostart_var.get(),
-                                        restart_on_crash=recovery_var.get(), python_path=python_var.get() or None)
+                                        restart_on_crash=recovery_var.get(), python_path=python_var.get() or None,
+                                        entry_file=entry_var.get().strip())
             except (OSError, ValueError) as exc:
                 messagebox.showerror("Invalid system settings", str(exc), parent=dialog)
                 return
@@ -563,7 +591,7 @@ class LauncherUI:
             if rt.terminal:
                 rt.terminal.session.config = changed
             rt.header_name.configure(text=changed.name)
-            rt.tab_path.configure(text=changed.folder)
+            rt.tab_path.configure(text=f"{changed.folder}  /  {changed.entry_file}")
             self.notebook.tab(rt.tab, text=self._tab_label(changed.name))
             self._refresh_sidebar()
             self._set_footer(f"Updated {changed.name}")

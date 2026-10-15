@@ -1,4 +1,4 @@
-"""Portable configuration and command resolution for Datatelcom Launcher.
+"""Portable configuration and command resolution for PythonRunManager.
 
 No applications are hardcoded. Only folders explicitly registered by the user
 are executable launch targets. The config is data, never a command template.
@@ -9,14 +9,14 @@ from dataclasses import dataclass, replace
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import shutil
 import sys
 import tempfile
 
-APP_NAME = "Datatelcom System Manager"
+APP_NAME = "PythonRunManager"
 CONFIG_NAME = "systems.json"
-CONFIG_VERSION = 2
+CONFIG_VERSION = 3
 MAX_SYSTEMS = 64
 MAX_CONFIG_BYTES = 512 * 1024
 MAX_PATH = 4096
@@ -31,6 +31,7 @@ class SystemConfig:
     auto_start: bool = True
     restart_on_crash: bool = False
     python_path: str | None = None
+    entry_file: str = "app.py"
 
 
 @dataclass(frozen=True)
@@ -60,9 +61,28 @@ def valid_folder(raw: str) -> Path:
     if not folder.is_absolute() or not folder.is_dir():
         raise ValueError("Choose an existing absolute folder path.")
     folder = folder.resolve(strict=True)
-    if not (folder / "app.py").is_file():
-        raise ValueError("The selected folder must contain app.py directly inside it.")
     return folder
+
+
+def _check_entry(entry_file: str) -> str:
+    if not isinstance(entry_file, str) or not entry_file or len(entry_file) > MAX_PATH:
+        raise ValueError("Choose a Python entry file inside the system folder.")
+    entry_file = entry_file.replace("\\", "/")
+    path = PurePosixPath(entry_file)
+    if (path.is_absolute() or PureWindowsPath(entry_file).drive or ".." in path.parts
+            or path.suffix.casefold() != ".py" or ":" in entry_file
+            or any(ord(c) < 32 or ord(c) == 127 for c in entry_file)):
+        raise ValueError("Entry file must be a relative .py path inside the system folder.")
+    return path.as_posix()
+
+
+def entry_path(folder: Path, entry_file: str) -> Path:
+    name = _check_entry(entry_file)
+    root = folder.resolve(strict=True)
+    script = (root / name).resolve(strict=True)
+    if not script.is_relative_to(root) or not script.is_file():
+        raise ValueError("Choose a Python entry file inside the system folder.")
+    return script
 
 
 def _check_name(name: str) -> str:
@@ -82,13 +102,19 @@ def _check_path(path: str) -> str:
     return path
 
 
-def create_system(folder: Path) -> SystemConfig:
+def create_system(folder: Path, entry_file: str = "app.py") -> SystemConfig:
     resolved = valid_folder(str(folder))
-    return SystemConfig(folder_id(resolved), str(resolved), _check_name(resolved.name))
+    entry_file = _check_entry(entry_file)
+    entry_path(resolved, entry_file)
+    return SystemConfig(folder_id(resolved), str(resolved), _check_name(resolved.name), entry_file=entry_file)
 
 
 def update_system(system: SystemConfig, *, name: str, auto_start: bool,
-                  restart_on_crash: bool, python_path: str | None) -> SystemConfig:
+                  restart_on_crash: bool, python_path: str | None,
+                  entry_file: str | None = None) -> SystemConfig:
+    selected_entry = _check_entry(system.entry_file if entry_file is None else entry_file)
+    if entry_file is not None:
+        entry_path(Path(system.folder), selected_entry)
     if python_path is not None:
         python_path = python_path.strip()
         if not python_path:
@@ -102,7 +128,7 @@ def update_system(system: SystemConfig, *, name: str, auto_start: bool,
                 raise ValueError("Select a Python .exe interpreter")
             python_path = str(executable.resolve(strict=True))
     return replace(system, name=_check_name(name), auto_start=bool(auto_start),
-                   restart_on_crash=bool(restart_on_crash), python_path=python_path)
+                   restart_on_crash=bool(restart_on_crash), python_path=python_path, entry_file=selected_entry)
 
 
 def _validate_config(config: LauncherConfig) -> None:
@@ -112,6 +138,7 @@ def _validate_config(config: LauncherConfig) -> None:
     for s in config.systems:
         path = _check_path(s.folder)
         _check_name(s.name)
+        _check_entry(s.entry_file)
         if type(s.auto_start) is not bool or type(s.restart_on_crash) is not bool:
             raise ValueError("Invalid per-system settings")
         if s.python_path is not None:
@@ -123,7 +150,7 @@ def _validate_config(config: LauncherConfig) -> None:
 
 
 def load_config(path: Path) -> tuple[LauncherConfig, str | None]:
-    """Support the v2 launcher's legacy version-1 list without hardcoded apps."""
+    """Migrate legacy v1/v2 settings, defaulting existing systems to app.py."""
     try:
         if not path.exists():
             return LauncherConfig(), None
@@ -151,13 +178,16 @@ def load_config(path: Path) -> tuple[LauncherConfig, str | None]:
                 systems.append(SystemConfig(folder_id(folder), path,
                                              _check_name(folder.name or "Python system")))
             config = LauncherConfig(tuple(systems))
-        elif version == CONFIG_VERSION:
+        elif version in {2, CONFIG_VERSION}:
             if type(data.get("auto_start_on_open")) is not bool:
                 raise ValueError("Invalid auto-start setting")
             for entry in entries:
                 if not isinstance(entry, dict):
                     raise ValueError("Invalid system entry")
-                if set(entry) != {"id", "folder", "name", "auto_start", "restart_on_crash", "python_path"}:
+                fields = {"id", "folder", "name", "auto_start", "restart_on_crash", "python_path"}
+                if version == CONFIG_VERSION:
+                    fields.add("entry_file")
+                if set(entry) != fields:
                     raise ValueError("System entry contains missing or unknown fields")
                 systems.append(SystemConfig(**entry))
             config = LauncherConfig(tuple(systems), data["auto_start_on_open"])
@@ -222,6 +252,8 @@ def resolved_python(folder: Path, override: str | None) -> list[str]:
 
 def command_for(system: SystemConfig) -> tuple[list[str], Path]:
     folder = Path(system.folder)
-    if not folder.is_dir() or not (folder / "app.py").is_file():
-        raise FileNotFoundError(f"app.py not found in system folder: {folder}")
-    return [*resolved_python(folder, system.python_path), "-u", "app.py"], folder
+    try:
+        script = entry_path(folder, system.entry_file)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"Entry file '{system.entry_file}' not found in system folder: {folder}") from exc
+    return [*resolved_python(folder, system.python_path), "-u", str(script)], folder
